@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -13,10 +14,18 @@ import (
 	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/monitor"
 	"github.com/gopcua/opcua/ua"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/metric/global"
+	"go.opentelemetry.io/otel/sdk/metric/aggregator/histogram"
+	controller "go.opentelemetry.io/otel/sdk/metric/controller/basic"
+	"go.opentelemetry.io/otel/sdk/metric/export/aggregation"
+	processor "go.opentelemetry.io/otel/sdk/metric/processor/basic"
+	selector "go.opentelemetry.io/otel/sdk/metric/selector/simple"
 )
 
 func main() {
 
+	configureOpentelemetry()
 	fmt.Println("Reading from public OPCUA end points")
 	opcua_endpoints := getPublicOPCUAEndpoints()
 	printEndPoints(opcua_endpoints)
@@ -169,4 +178,39 @@ func startCallbackSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag
 	defer cleanup(ctx, sub, wg)
 
 	<-ctx.Done()
+}
+
+func configureOpentelemetry() {
+	exporter := configureMetrics()
+
+	http.HandleFunc("/metrics", exporter.ServeHTTP)
+	fmt.Println("listenening on http://localhost:8088/metrics")
+
+	go func() {
+		_ = http.ListenAndServe(":8088", nil)
+	}()
+}
+
+func configureMetrics() *prometheus.Exporter {
+	config := prometheus.Config{}
+
+	ctrl := controller.New(
+		processor.NewFactory(
+			selector.NewWithHistogramDistribution(
+				histogram.WithExplicitBoundaries(config.DefaultHistogramBoundaries),
+			),
+			//export.CumulativeExportKindSelector(),
+			aggregation.CumulativeTemporalitySelector(),
+			processor.WithMemory(true),
+		),
+	)
+
+	exporter, err := prometheus.New(config, ctrl)
+	if err != nil {
+		panic(err)
+	}
+
+	global.SetMeterProvider(exporter.MeterProvider())
+
+	return exporter
 }
