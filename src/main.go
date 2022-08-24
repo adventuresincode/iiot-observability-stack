@@ -15,17 +15,25 @@ import (
 	"github.com/gopcua/opcua/monitor"
 	"github.com/gopcua/opcua/ua"
 	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/global"
 	"go.opentelemetry.io/otel/sdk/metric/aggregator/histogram"
+	"go.opentelemetry.io/otel/metric/instrument"
 	controller "go.opentelemetry.io/otel/sdk/metric/controller/basic"
 	"go.opentelemetry.io/otel/sdk/metric/export/aggregation"
 	processor "go.opentelemetry.io/otel/sdk/metric/processor/basic"
 	selector "go.opentelemetry.io/otel/sdk/metric/selector/simple"
 )
 
+var globalMeter metric.Meter
+
 func main() {
 
+	fmt.Println("Configuring OpenTelemetry")
 	configureOpentelemetry()
+	globalMeter = global.Meter("mis/opcua")
+
+
 	fmt.Println("Reading from public OPCUA end points")
 	opcua_endpoints := getPublicOPCUAEndpoints()
 	printEndPoints(opcua_endpoints)
@@ -156,16 +164,51 @@ func cleanup(ctx context.Context, sub *monitor.Subscription, wg *sync.WaitGroup)
 }
 
 func startCallbackSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag time.Duration, wg *sync.WaitGroup, nodes ...string) {
+	// Activity/error/success counters
+	activity_counter,_ := globalMeter.SyncInt64().Counter("mis_opcua_activity_counter")
+	error_counter,_ := globalMeter.SyncInt64().Counter("mis_opcua_error_counter")
+	success_counter,_ := globalMeter.SyncInt64().Counter("mis_opcua_success_counter")
+
+	// Timestamp of last received datapoint
+	var last_activity_timestamp time.Time
+	last_activity_gauge,_ := globalMeter.AsyncInt64().Gauge("mis_opcua_last_activity_timestamp")
+	_ = globalMeter.RegisterCallback([]instrument.Asynchronous{last_activity_gauge}, func(ctx context.Context) {
+		last_activity_gauge.Observe(ctx, last_activity_timestamp.Unix())
+	})
+
+	//var opcuaNodeToGauge = make(map[string]Gauge, 100)
+
 	sub, err := m.Subscribe(
 		ctx,
 		&opcua.SubscriptionParameters{
 			Interval: interval,
 		},
 		func(s *monitor.Subscription, msg *monitor.DataChangeMessage) {
+			activity_counter.Add(ctx, 1)
 			if msg.Error != nil {
 				log.Printf("[callback] error=%s", msg.Error)
+				error_counter.Add(ctx, 1)
 			} else {
 				log.Printf("[callback] node=%s value=%v", msg.NodeID, msg.Value.Value())
+				/*
+				gauge, did_exist = opcuaNodeToGauge[msg.NodeId]
+				if !did_exist {
+					gauge,_ = globalMeter.AsyncInt64().Gauge(msg.NodeID)
+					opcuaNodeToGauge[msg.NodeID] = gauge
+					_ = globalMeter.RegisterCallback(
+						[]instrument.Asynchronous{gaugeObserver},
+						func(ctx context.Context) {
+							(*observerLock).RLock()
+							value := *observerValueToReport
+							attrs := *observerAttrsToReport
+							(*observerLock).RUnlock()
+							gaugeObserver.Observe(ctx, value, attrs...)
+						})
+
+				}
+				*/
+				last_activity_timestamp = time.Now()
+				success_counter.Add(ctx, 1)
 			}
 			time.Sleep(lag)
 		},
@@ -199,7 +242,6 @@ func configureMetrics() *prometheus.Exporter {
 			selector.NewWithHistogramDistribution(
 				histogram.WithExplicitBoundaries(config.DefaultHistogramBoundaries),
 			),
-			//export.CumulativeExportKindSelector(),
 			aggregation.CumulativeTemporalitySelector(),
 			processor.WithMemory(true),
 		),
