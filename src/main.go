@@ -14,11 +14,12 @@ import (
 	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/monitor"
 	"github.com/gopcua/opcua/ua"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/global"
-	"go.opentelemetry.io/otel/sdk/metric/aggregator/histogram"
 	"go.opentelemetry.io/otel/metric/instrument"
+	"go.opentelemetry.io/otel/sdk/metric/aggregator/histogram"
 	controller "go.opentelemetry.io/otel/sdk/metric/controller/basic"
 	"go.opentelemetry.io/otel/sdk/metric/export/aggregation"
 	processor "go.opentelemetry.io/otel/sdk/metric/processor/basic"
@@ -33,10 +34,9 @@ func main() {
 	configureOpentelemetry()
 	globalMeter = global.Meter("mis/opcua")
 
-
 	fmt.Println("Reading from public OPCUA end points")
 	opcua_endpoints := getPublicOPCUAEndpoints()
-	printEndPoints(opcua_endpoints)
+	//printEndPoints(opcua_endpoints)
 	browseEndPoint(opcua_endpoints[0])
 	monitorDevices(opcua_endpoints[0])
 }
@@ -78,15 +78,16 @@ func browseEndPoint(endpoint string) {
 	if err != nil {
 		log.Fatalf("invalid node id: %s", nodeID)
 	}
+	fmt.Printf("nid: %s\n", nid)
 
 	n := c.Node(nid)
 
-	// attrs, err := n.Attributes(ua.AttributeIDBrowseName, ua.AttributeIDDataType)
-	// if err != nil {
-	// 	log.Fatalf("invalid attribute: %s", err.Error())
-	// }
-	//fmt.Printf("BrowseName: %s; DataType: %s\n", attrs[0].Value, getDataType(attrs[1]))
-	//fmt.Printf("BrowseName: %s; DataType: %s\n", attrs[1].Value, getDataType(attrs[1]))
+	attrs, err := n.Attributes(ua.AttributeIDBrowseName, ua.AttributeIDDataType)
+	if err != nil {
+		log.Fatalf("invalid attribute: %s", err.Error())
+	}
+	fmt.Printf("BrowseName: %s; DataType: %s\n", attrs[0].Value, getDataType(attrs[1]))
+	fmt.Printf("BrowseName: %s; DataType: %s\n", attrs[1].Value, getDataType(attrs[1]))
 
 	// Get children
 	refs, err := n.ReferencedNodes(id.HasComponent, ua.BrowseDirectionForward, ua.NodeClassAll, true)
@@ -120,7 +121,7 @@ func getDataType(value *ua.DataValue) string {
 }
 
 func monitorDevices(endpoint string) {
-	nodeID := "ns=2;s=Dynamic/RandomFloat"
+	nodeID := "ns=2" + ";s=Dynamic" + "/RandomFloat"
 
 	signalCh := make(chan os.Signal, 1)
 	signal.Notify(signalCh, os.Interrupt)
@@ -152,9 +153,73 @@ func monitorDevices(endpoint string) {
 	wg := &sync.WaitGroup{}
 
 	wg.Add(1)
-	go startCallbackSub(ctx, m, time.Second, 0, wg, nodeID)
+	go startChanSub(ctx, m, time.Second, 0, wg, nodeID)
 	<-ctx.Done()
 	wg.Wait()
+}
+
+func startChanSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag time.Duration, wg *sync.WaitGroup, nodes ...string) {
+	// Activity/error/success counters
+	activity_counter, _ := globalMeter.SyncInt64().Counter("mis_opcua_activity_counter")
+	error_counter, _ := globalMeter.SyncInt64().Counter("mis_opcua_error_counter")
+	success_counter, _ := globalMeter.SyncInt64().Counter("mis_opcua_success_counter")
+	last_activity_gauge, _ := globalMeter.AsyncInt64().Gauge("mis_opcua_last_activity_timestamp")
+
+	stringGauge, _ := globalMeter.AsyncInt64().Gauge("mis_opcua_value_string")
+	booleanGauge, _ := globalMeter.AsyncInt64().Gauge("mis_opcua_value_boolean")
+	integerGauge, _ := globalMeter.AsyncInt64().Gauge("mis_opcua_value_integer")
+	floatGauge, _ := globalMeter.AsyncFloat64().Gauge("mis_opcua_value_float")
+
+	ch := make(chan *monitor.DataChangeMessage, 128)
+	sub, err := m.ChanSubscribe(ctx, &opcua.SubscriptionParameters{Interval: interval}, ch, nodes...)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer cleanup(ctx, sub, wg)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-ch:
+			activity_counter.Add(ctx, 1)
+
+			if msg.Error != nil {
+				log.Printf("[callback] error=%s", msg.Error)
+				error_counter.Add(ctx, 1)
+			} else {
+				stringIdAttribute := attribute.String("nodeid_stringid", msg.NodeID.StringID())
+				log.Printf("[callback] node=%s value=%v", msg.NodeID, msg.Value.Value())
+				switch msg.Value.Type() {
+				case ua.TypeIDBoolean:
+					value := int64(0)
+					if msg.Value.Bool() {
+						value = 1
+					}
+					booleanGauge.Observe(ctx, value, stringIdAttribute, attribute.Bool("boolean_value", msg.Value.Bool()))
+				case ua.TypeIDString:
+					stringGauge.Observe(ctx, 1, stringIdAttribute, attribute.String("string_value", msg.Value.String()))
+				case ua.TypeIDDouble, ua.TypeIDFloat:
+					value := float64(msg.Value.Float())
+					floatGauge.Observe(ctx, value, stringIdAttribute)
+				case ua.TypeIDSByte, ua.TypeIDInt16, ua.TypeIDInt32, ua.TypeIDInt64:
+					value := int64(msg.Value.Int())
+					integerGauge.Observe(ctx, value, stringIdAttribute)
+				case ua.TypeIDByte, ua.TypeIDUint16, ua.TypeIDUint32, ua.TypeIDUint64:
+					// There is no uint gauge?
+					value := int64(msg.Value.Int())
+					integerGauge.Observe(ctx, value, stringIdAttribute)
+				default:
+					log.Println()
+				}
+				last_activity_gauge.Observe(ctx, time.Now().Unix())
+				success_counter.Add(ctx, 1)
+			}
+			time.Sleep(lag)
+		}
+	}
 }
 
 func cleanup(ctx context.Context, sub *monitor.Subscription, wg *sync.WaitGroup) {
@@ -165,18 +230,16 @@ func cleanup(ctx context.Context, sub *monitor.Subscription, wg *sync.WaitGroup)
 
 func startCallbackSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag time.Duration, wg *sync.WaitGroup, nodes ...string) {
 	// Activity/error/success counters
-	activity_counter,_ := globalMeter.SyncInt64().Counter("mis_opcua_activity_counter")
-	error_counter,_ := globalMeter.SyncInt64().Counter("mis_opcua_error_counter")
-	success_counter,_ := globalMeter.SyncInt64().Counter("mis_opcua_success_counter")
+	activity_counter, _ := globalMeter.SyncInt64().Counter("mis_opcua_activity_counter")
+	error_counter, _ := globalMeter.SyncInt64().Counter("mis_opcua_error_counter")
+	success_counter, _ := globalMeter.SyncInt64().Counter("mis_opcua_success_counter")
 
 	// Timestamp of last received datapoint
 	var last_activity_timestamp time.Time
-	last_activity_gauge,_ := globalMeter.AsyncInt64().Gauge("mis_opcua_last_activity_timestamp")
+	last_activity_gauge, _ := globalMeter.AsyncInt64().Gauge("mis_opcua_last_activity_timestamp")
 	_ = globalMeter.RegisterCallback([]instrument.Asynchronous{last_activity_gauge}, func(ctx context.Context) {
 		last_activity_gauge.Observe(ctx, last_activity_timestamp.Unix())
 	})
-
-	//var opcuaNodeToGauge = make(map[string]Gauge, 100)
 
 	sub, err := m.Subscribe(
 		ctx,
@@ -191,21 +254,20 @@ func startCallbackSub(ctx context.Context, m *monitor.NodeMonitor, interval, lag
 			} else {
 				log.Printf("[callback] node=%s value=%v", msg.NodeID, msg.Value.Value())
 				/*
-				gauge, did_exist = opcuaNodeToGauge[msg.NodeId]
-				if !did_exist {
-					gauge,_ = globalMeter.AsyncInt64().Gauge(msg.NodeID)
-					opcuaNodeToGauge[msg.NodeID] = gauge
-					_ = globalMeter.RegisterCallback(
-						[]instrument.Asynchronous{gaugeObserver},
-						func(ctx context.Context) {
-							(*observerLock).RLock()
-							value := *observerValueToReport
-							attrs := *observerAttrsToReport
-							(*observerLock).RUnlock()
-							gaugeObserver.Observe(ctx, value, attrs...)
-						})
+					log.Printf("[callback] node=%s value=%v", msg.NodeID, msg.Value.Value())
+					gauge, did_exist = opcuaNodeToGauge[msg.NodeId]
+					if !did_exist {
+						gauge,_ = globalMeter.AsyncInt64().Gauge(msg.NodeID)
+						opcuaNodeToGauge[msg.NodeID] = gauge
+						_ = globalMeter.RegisterCallback(
+							[]instrument.Asynchronous{gaugeObserver},
+							func(ctx context.Context) {
+								value := *observerValueToReport
+								attrs := *observerAttrsToReport
+								gaugeObserver.Observe(ctx, value, attrs...)
+							})
 
-				}
+					}
 				*/
 				last_activity_timestamp = time.Now()
 				success_counter.Add(ctx, 1)
