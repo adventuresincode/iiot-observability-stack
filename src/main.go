@@ -49,8 +49,8 @@ func main() {
 		mode     = flag.String("mode", "None", "Security mode: None, Sign, SignAndEncrypt. Default: auto")
 		// certFile = flag.String("cert", "", "Path to cert.pem. Required for security mode/policy != None")
 		// keyFile  = flag.String("key", "", "Path to private key.pem. Required for security mode/policy != None")
-		nodeIDs = flag.String("nodes", "", "node ids to subscribe to, seperated by commas")
-		// nodePre  = flag.String("prefix", "ns=2;s=0:", "prefix to add to Node IDs.")
+		nodeIDs = flag.String("nodes", "SpikeData,StepUp,DipData,FastNumberOfUpdates,SlowNumberOfUpdates", "node ids to subscribe to, seperated by commas")
+		nodePre = flag.String("prefix", "ns=2;", "prefix to add to Node IDs.")
 		// interval = flag.String("interval", opcua.DefaultSubscriptionInterval.String(), "subscription interval")
 	)
 
@@ -83,7 +83,10 @@ func main() {
 		log.Fatal("Failed to find suitable endpoint")
 	}
 
-	nodeList := strings.Split(*nodeIDs, ";")
+	var nodeList []string
+	for _, nodeID := range strings.Split(*nodeIDs, ",") {
+		nodeList = append(nodeList, *nodePre+nodeID)
+	}
 
 	opcuaOpts := []opcua.Option{
 		opcua.SecurityPolicy(*policy),
