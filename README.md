@@ -13,6 +13,8 @@ go get go.opentelemetry.io/otel/exporters/prometheus
 go get github.com/gopcua/opcua/errors@v0.3.5
 ```
 ## Configure Promethues to scrape from the endpoint
+Reference: https://medium.com/javarevisited/monitoring-setup-with-docker-compose-part-1-prometheus-3d2c9089ee82   
+
 prometheus/prometheus.yml:
 ```yaml
 global:
@@ -61,4 +63,18 @@ volumes:
   prometheus-data:
 ```
 
+Run 
+```bash 
+docker-compose up
+```
 ## Pushing the metrics from the OPCUA endpoint to the exporter
+
+
+
+----
+## Starting the Simulator
+
+```bash
+docker pull mcr.microsoft.com/iotedge/opc-plc:2.5.0
+docker run --rm -it -p 50000:50000 -p 8080:8080 --name opcplc mcr.microsoft.com/iotedge/opc-plc:latest --pn=50000 --autoaccept --ut --dca --sph --sn=5 --sr=10 --st=uint --fn=5 --fr=1 --ft=uint --ctb --scn --lid --lsn --ref --gn=5
+```

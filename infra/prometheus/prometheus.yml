@@ -14,5 +14,6 @@ scrape_configs:
           - 'idonotexists:564'
   
   - job_name: 'opentelemetry'
+    metrics_path: /metrics
     static_configs:
-      - targets: ['localhost:8088']        
+      - targets: ['2pdevvm:8088']        
