@@ -2,16 +2,18 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gopcua/opcua"
-	"github.com/gopcua/opcua/id"
+	"github.com/gopcua/opcua/debug"
 	"github.com/gopcua/opcua/monitor"
 	"github.com/gopcua/opcua/ua"
 	"go.opentelemetry.io/otel/attribute"
@@ -27,19 +29,6 @@ import (
 
 var globalMeter metric.Meter
 
-func main() {
-
-	fmt.Println("Configuring OpenTelemetry")
-	configureOpentelemetry()
-	globalMeter = global.Meter("mis/opcua")
-
-	fmt.Println("Reading from public OPCUA end points")
-	opcua_endpoints := getPublicOPCUAEndpoints()
-	//printEndPoints(opcua_endpoints)
-	browseEndPoint(opcua_endpoints[0])
-	monitorDevices(opcua_endpoints[0])
-}
-
 func getPublicOPCUAEndpoints() []string {
 	epList := []string{
 		"opc.tcp://milo.digitalpetri.com:62541/milo",
@@ -53,14 +42,63 @@ func getPublicOPCUAEndpoints() []string {
 	return epList
 }
 
-func printEndPoints(opcua_endpoints []string) {
+func main() {
+	var (
+		endpoint = flag.String("endpoint", "opc.tcp://127.0.1.1:50000", "OPC UA Endpoint URL")
+		policy   = flag.String("policy", "None", "Security policy: None, Basic128Rsa15, Basic256, Basic256Sha256. Default: auto")
+		mode     = flag.String("mode", "None", "Security mode: None, Sign, SignAndEncrypt. Default: auto")
+		// certFile = flag.String("cert", "", "Path to cert.pem. Required for security mode/policy != None")
+		// keyFile  = flag.String("key", "", "Path to private key.pem. Required for security mode/policy != None")
+		nodeIDs = flag.String("nodes", "", "node ids to subscribe to, seperated by commas")
+		// nodePre  = flag.String("prefix", "ns=2;s=0:", "prefix to add to Node IDs.")
+		// interval = flag.String("interval", opcua.DefaultSubscriptionInterval.String(), "subscription interval")
+	)
 
-	for index, en := range opcua_endpoints {
-		fmt.Println(" ", index+1, ". ", en)
+	flag.BoolVar(&debug.Enable, "debug", false, "enable debug logging")
+	flag.Parse()
+
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		<-signalCh
+		println()
+		cancel()
+	}()
+
+	fmt.Println("Configuring OpenTelemetry")
+	configureOpentelemetry()
+	globalMeter = global.Meter("mis/opcua")
+
+	opcuaEndpoints, err := opcua.GetEndpoints(ctx, *endpoint)
+	if err != nil {
+		log.Fatal(err)
 	}
+
+	ep := opcua.SelectEndpoint(opcuaEndpoints, *policy, ua.MessageSecurityModeFromString(*mode))
+	if ep == nil {
+		log.Fatal("Failed to find suitable endpoint")
+	}
+
+	nodeList := strings.Split(*nodeIDs, ";")
+
+	opcuaOpts := []opcua.Option{
+		opcua.SecurityPolicy(*policy),
+		opcua.SecurityModeString(*mode),
+		// opcua.CertificateFile(*certFile),
+		// opcua.PrivateKeyFile(*keyFile),
+		opcua.AuthAnonymous(),
+		opcua.SecurityFromEndpoint(ep, ua.UserTokenTypeAnonymous),
+	}
+
+	// browseEndPoint(endpoint)
+	monitorDevices(ctx, *ep, opcuaOpts, nodeList)
 }
 
-func browseEndPoint(endpoint string) {
+/* func browseEndPoint(endpoint string) {
 
 	nodeID := "ns=0;i=85"
 
@@ -117,24 +155,12 @@ func getDataType(value *ua.DataValue) string {
 	}
 
 	return value.Value.NodeID().String()
-}
+} */
 
-func monitorDevices(endpoint string) {
-	nodeID := "ns=2" + ";s=Dynamic" + "/RandomFloat"
+func monitorDevices(ctx context.Context, endpoint ua.EndpointDescription, opcuaOpts []opcua.Option, nodeIdList []string) {
+	// nodeID := "ns=2" + ";s=Dynamic" + "/RandomFloat"
 
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, os.Interrupt)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		<-signalCh
-		println()
-		cancel()
-	}()
-
-	c := opcua.NewClient(endpoint, opcua.SecurityMode(ua.MessageSecurityModeNone))
+	c := opcua.NewClient(endpoint.EndpointURL, opcuaOpts...)
 
 	if err := c.Connect(ctx); err != nil {
 		log.Fatal(err)
@@ -152,7 +178,7 @@ func monitorDevices(endpoint string) {
 	wg := &sync.WaitGroup{}
 
 	wg.Add(1)
-	go startChanSub(ctx, m, time.Second, 0, wg, nodeID)
+	go startChanSub(ctx, m, time.Second, 0, wg, nodeIdList...)
 	<-ctx.Done()
 	wg.Wait()
 }
